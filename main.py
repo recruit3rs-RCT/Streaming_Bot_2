@@ -214,29 +214,38 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     if not rows:
         return await interaction.followup.send("No streaming data for chart!")
     
-    names = [interaction.guild.get_member(uid).display_name if interaction.guild.get_member(uid) else f"ID{uid}" for uid, _ in rows]
+    # Use Discord IDs instead of display names
+    user_ids = [str(uid) for uid, _ in rows]
     hours = np.array([t / 3600 for _, t in rows])
     
+    # Enable Unicode support for special characters
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    plt.rcParams['axes.unicode_minus'] = False
+    
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(12, max(6, len(names)*0.5)))
-    y_pos = np.arange(len(names))
-    bars = ax.barh(y_pos, hours, color='#5865F2')
+    fig, ax = plt.subplots(figsize=(14, max(7, len(user_ids)*0.6)))
+    y_pos = np.arange(len(user_ids))
+    bars = ax.barh(y_pos, hours, color='#5865F2', edgecolor='white', linewidth=0.5)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(names, fontsize=10)
-    ax.set_xlabel('Hours Streaming', fontsize=12)
-    ax.set_title(f'🎥 {interaction.guild.name} - Top {limit} Streaming Chart', fontsize=14, fontweight='bold')
-    ax.grid(axis='x', alpha=0.3)
+    ax.set_yticklabels(user_ids, fontsize=11, family='monospace')
+    ax.set_xlabel('Hours Streaming', fontsize=13, fontweight='bold')
+    ax.set_title(f'🎥 {interaction.guild.name} - Top {limit} Streaming Chart', 
+                 fontsize=16, fontweight='bold', pad=20)
+    ax.grid(axis='x', alpha=0.25, linestyle='--')
+    ax.set_facecolor('#2C2F33')
+    fig.patch.set_facecolor('#23272A')
     
     for i, bar in enumerate(bars):
         width = bar.get_width()
         if width > 0:
-            ax.text(width + max(hours)*0.01, bar.get_y() + bar.get_height()/2, 
-                    f'{hours[i]:.2f}h', ha='left', va='center', color='white', fontsize=9)
+            ax.text(width + max(hours)*0.015, bar.get_y() + bar.get_height()/2, 
+                    f'{hours[i]:.2f}h', ha='left', va='center', 
+                    color='white', fontsize=10, fontweight='bold')
     
     plt.tight_layout()
     
     img_bytes = io.BytesIO()
-    plt.savefig(img_bytes, format='PNG', bbox_inches='tight', dpi=120)
+    plt.savefig(img_bytes, format='PNG', bbox_inches='tight', dpi=130)
     img_bytes.seek(0)
     file = discord.File(img_bytes, 'streaming_chart.png')
     await interaction.followup.send("📊 **Streaming Time Chart**", file=file)
