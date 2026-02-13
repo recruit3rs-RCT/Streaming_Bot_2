@@ -17,7 +17,7 @@ DB_PATH = os.getenv('DB_PATH', 'voice_stats.db')
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
-intents.message_content = True  # For slash commands
+intents.message_content = True  # Slash commands
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -61,7 +61,7 @@ async def on_voice_state_update(member, before, after):
     user_id = member.id
     key = (guild_id, user_id)
     
-    # Voice tracking
+    # Voice time tracking
     if before.channel is None and after.channel:
         join_times[key] = asyncio.get_event_loop().time()
     elif before.channel and after.channel is None:
@@ -75,7 +75,7 @@ async def on_voice_state_update(member, before, after):
                 await db.commit()
             del join_times[key]
     
-    # Streaming role
+    # Streaming role logic
     role = discord.utils.get(member.guild.roles, name=STREAM_ROLE_NAME)
     if role:
         if after.self_stream and not before.self_stream and role not in member.roles:
@@ -89,8 +89,8 @@ async def on_voice_state_update(member, before, after):
             except:
                 pass
 
-@bot.tree.command(name="leaderboard", description="Show voice activity top 10")
-@app.describe(limit="Top N (default 10)")
+@bot.tree.command(name="leaderboard", description="Show voice activity leaderboard")
+@leaderboard_slash.describe(limit="Top N users, default 10")
 async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
     await interaction.response.defer()
     
@@ -101,7 +101,7 @@ async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
     if not rows:
         return await interaction.followup.send("No voice stats yet!")
     
-    embed = discord.Embed(title=f"🎤 Top {limit} Voice Activity", color=0x00ff00)
+    embed = discord.Embed(title=f"🎤 Top {limit} Voice Activity - {interaction.guild.name}", color=0x00ff00)
     for i, (user_id, secs) in enumerate(rows, 1):
         user = interaction.guild.get_member(user_id)
         name = user.display_name if user else f"ID {user_id}"
@@ -109,7 +109,7 @@ async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="chart", description="Voice activity bar chart")
-@app.describe(limit="Top N (default 10)")
+@chart_slash.describe(limit="Top N users, default 10")
 async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     await interaction.response.defer()
     
@@ -121,28 +121,33 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
         return await interaction.followup.send("No data for chart!")
     
     names = [interaction.guild.get_member(uid).display_name if interaction.guild.get_member(uid) else f"ID{uid}" for uid, _ in rows]
-    hours = [t / 3600 for _, t in rows]
+    hours = np.array([t / 3600 for _, t in rows])
     
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(10, max(6, len(names)*0.5)))
+    fig, ax = plt.subplots(figsize=(10, max(6, len(names)*0.4)))
     y_pos = np.arange(len(names))
-    ax.barh(y_pos, hours, color='skyblue')
+    bars = ax.barh(y_pos, hours, color='skyblue')
     ax.set_yticks(y_pos)
     ax.set_yticklabels(names)
     ax.set_xlabel('Hours in Voice')
-    ax.set_title(f'Top {limit} Voice Leaderboard')
+    ax.set_title(f'{interaction.guild.name} - Top {limit} Voice Chart')
+    
+    for i, bar in enumerate(bars):
+        width = bar.get_width()
+        ax.text(width + 0.01, bar.get_y() + bar.get_height()/2, f'{hours[i]:.1f}h', 
+                ha='left', va='center', color='white')
+    
     plt.tight_layout()
     
     img_bytes = io.BytesIO()
-    plt.savefig(img_bytes, format='PNG', bbox_inches='tight')
+    plt.savefig(img_bytes, format='PNG', bbox_inches='tight', dpi=100)
     img_bytes.seek(0)
-    file = discord.File(img_bytes, 'leaderboard.png')
-    await interaction.followup.send("📊 Voice Activity Chart:", file=file)
-    plt.close()
+    file = discord.File(img_bytes, 'voice_chart.png')
+    await interaction.followup.send("📊 Voice Leaderboard Chart:", file=file)
+    plt.close(fig)
 
 @bot.event
 async def on_guild_join(guild):
-    # Sync slash commands on join
     bot.tree.copy_global_to(guild=guild)
     synced = await bot.tree.sync(guild=guild)
     print(f"Synced {len(synced)} commands to {guild}")
