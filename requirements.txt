@@ -1,0 +1,5 @@
+discord.py
+flask
+aiosqlite
+matplotlib
+numpy
