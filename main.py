@@ -50,7 +50,13 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     await init_db()
     Thread(target=run_flask, daemon=True).start()
-    print("Bot ready!")
+    
+    # Sync slash commands globally
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash commands globally")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
 
 join_times = {}
 
@@ -92,6 +98,16 @@ async def on_voice_state_update(member, before, after):
                 print(f"Removed {role.name} from {member}")
             except Exception as e:
                 print(f"Role remove error: {e}")
+
+@bot.command()
+@commands.is_owner()
+async def sync(ctx):
+    """Manual sync command (owner only)"""
+    try:
+        synced = await bot.tree.sync()
+        await ctx.send(f"✅ Synced {len(synced)} global slash commands!")
+    except Exception as e:
+        await ctx.send(f"❌ Sync failed: {e}")
 
 @bot.tree.command(name="leaderboard", description="Show voice activity leaderboard (limit: 1-20)")
 async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
