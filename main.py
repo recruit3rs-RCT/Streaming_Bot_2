@@ -214,20 +214,26 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     if not rows:
         return await interaction.followup.send("No streaming data for chart!")
     
-    # Use Discord IDs instead of display names
-    user_ids = [str(uid) for uid, _ in rows]
+    # Use Discord username (e.g., tox_185) instead of display name
+    usernames = []
+    for uid, _ in rows:
+        user = interaction.guild.get_member(uid)
+        if user:
+            usernames.append(user.name)  # Discord username, not display_name
+        else:
+            usernames.append(f"ID{uid}")
+    
     hours = np.array([t / 3600 for _, t in rows])
     
-    # Enable Unicode support for special characters
     plt.rcParams['font.family'] = 'DejaVu Sans'
     plt.rcParams['axes.unicode_minus'] = False
     
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(14, max(7, len(user_ids)*0.6)))
-    y_pos = np.arange(len(user_ids))
+    fig, ax = plt.subplots(figsize=(14, max(7, len(usernames)*0.6)))
+    y_pos = np.arange(len(usernames))
     bars = ax.barh(y_pos, hours, color='#5865F2', edgecolor='white', linewidth=0.5)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(user_ids, fontsize=11, family='monospace')
+    ax.set_yticklabels(usernames, fontsize=11, family='monospace')
     ax.set_xlabel('Hours Streaming', fontsize=13, fontweight='bold')
     ax.set_title(f'🎥 {interaction.guild.name} - Top {limit} Streaming Chart', 
                  fontsize=16, fontweight='bold', pad=20)
