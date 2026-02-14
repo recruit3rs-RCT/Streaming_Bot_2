@@ -21,7 +21,6 @@ logger = logging.getLogger('StreamBot')
 
 # Environment variables
 TOKEN = os.getenv('DISCORD_TOKEN')
-STREAM_ROLE_NAME = "Streaming stat"
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 # Validate environment variables
@@ -55,7 +54,7 @@ def health():
     return {"status": "unhealthy", "bot": "not ready"}, 503
 
 def run_flask():
-    port = int(os.getenv('PORT', 10000))  # Render uses 10000 by default
+    port = int(os.getenv('PORT', 10000))
     app.run(host='0.0.0.0', port=port, threaded=True)
 
 def keep_alive():
@@ -86,13 +85,12 @@ async def init_db():
     """Initialize database connection pool with proper error handling"""
     global db_pool
     try:
-        # Add SSL requirement for Render PostgreSQL
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=2,
             max_size=10,
             command_timeout=60,
-            ssl='require'  # Required for Render.com PostgreSQL
+            ssl='require'
         )
         
         async with db_pool.acquire() as conn:
@@ -106,7 +104,6 @@ async def init_db():
                 )
             ''')
             
-            # Add index for faster queries
             await conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_guild_total 
                 ON voice_time(guild_id, total_seconds DESC)
@@ -123,27 +120,24 @@ async def on_ready():
     """Bot startup event"""
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     
-    # Initialize database
     db_ready = await init_db()
     if not db_ready:
         logger.error("Failed to initialize database. Bot may not function properly.")
         return
     
-    # Sync slash commands
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} slash commands globally")
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
     
-    # Start background tasks
     if not save_streaming_time.is_running():
         save_streaming_time.start()
     if not auto_update_vc_roles.is_running():
         auto_update_vc_roles.start()
     
     logger.info("🔄 Background tasks started (30s auto-save, 5min role update)")
-    logger.info("✅ Stream LB Bot ready with dual-condition tracking (streaming + role)")
+    logger.info("✅ Stream LB Bot ready - tracking all streaming activity!")
 
 @bot.event
 async def on_close():
@@ -170,14 +164,13 @@ async def on_close():
         except Exception as e:
             logger.error(f"Error saving final session: {e}")
     
-    # Close database pool
     if db_pool:
         await db_pool.close()
         logger.info("🔒 Database pool closed")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Track streaming time ONLY when: 1) Actually streaming AND 2) Has 'Streaming stat' role"""
+    """Track streaming time based ONLY on self_stream status"""
     if member.bot or not member.guild:
         return
     
@@ -185,31 +178,18 @@ async def on_voice_state_update(member, before, after):
     user_id = member.id
     key = (guild_id, user_id)
     
-    # Get the streaming stat role
-    stream_role = discord.utils.get(member.guild.roles, name=STREAM_ROLE_NAME)
-    if not stream_role:
-        return
-    
-    # Check both conditions NOW
+    # Check streaming status - before and after
     is_streaming_now = after.channel is not None and after.self_stream
-    has_role_now = stream_role in member.roles
-    
-    # Check both conditions BEFORE
     was_streaming_before = before.channel is not None and before.self_stream
-    had_role_before = stream_role in member.roles
     
-    # Both conditions to track: streaming + has role
-    should_track_now = is_streaming_now and has_role_now
-    was_tracking_before = was_streaming_before and had_role_before
-    
-    # START tracking: Both conditions met now, wasn't tracking before
-    if should_track_now and not was_tracking_before and key not in join_times:
+    # START tracking: User started streaming
+    if is_streaming_now and not was_streaming_before and key not in join_times:
         join_times[key] = asyncio.get_event_loop().time()
         channel_name = after.channel.name if after.channel else "Unknown"
         logger.info(f"▶️ Started tracking {member.name} (streaming in {channel_name})")
     
-    # STOP tracking: Either condition lost
-    elif was_tracking_before and not should_track_now and key in join_times:
+    # STOP tracking: User stopped streaming
+    elif was_streaming_before and not is_streaming_now and key in join_times:
         session_time = int(asyncio.get_event_loop().time() - join_times[key])
         
         # Only save if more than 5 seconds (avoid false triggers)
@@ -226,18 +206,18 @@ async def on_voice_state_update(member, before, after):
                 logger.info(f"✅ Saved {session_time}s for {member.name}")
             except Exception as e:
                 logger.error(f"❌ Database save error for {member.name}: {e}")
+        else:
+            logger.info(f"⏭️ Skipped {session_time}s for {member.name} (too short)")
         
         del join_times[key]
-        reason = "stopped streaming" if not is_streaming_now else "role removed"
-        logger.info(f"⏹️ Stopped tracking {member.name} ({reason})")
+        logger.info(f"⏹️ Stopped tracking {member.name} (stopped streaming)")
 
 @tasks.loop(seconds=30)
 async def save_streaming_time():
-    """Save streaming time every 30 seconds - ONLY for users actively streaming WITH role"""
+    """Save streaming time every 30 seconds - ONLY for users actively streaming"""
     if not db_pool:
         return
     
-    # Create snapshot of keys to avoid runtime modification issues
     keys_snapshot = list(join_times.keys())
     
     for key in keys_snapshot:
@@ -256,17 +236,11 @@ async def save_streaming_time():
             if not member:
                 continue
             
-            # Get the streaming stat role
-            stream_role = discord.utils.get(guild.roles, name=STREAM_ROLE_NAME)
-            if not stream_role:
-                continue
-            
-            # Check BOTH conditions: streaming + has role
+            # Check if still streaming
             is_streaming = member.voice and member.voice.self_stream
-            has_role = stream_role in member.roles
             
-            # If either condition is lost, save final time and stop tracking
-            if not is_streaming or not has_role:
+            # If stopped streaming, save final time and stop tracking
+            if not is_streaming:
                 session_time = int(asyncio.get_event_loop().time() - join_time)
                 if session_time >= 5:
                     async with db_pool.acquire() as conn:
@@ -277,14 +251,12 @@ async def save_streaming_time():
                             DO UPDATE SET total_seconds = voice_time.total_seconds + $3,
                                          last_updated = NOW()
                         ''', guild_id, user_id, session_time)
-                    reason = "not streaming" if not is_streaming else "role removed"
-                    logger.info(f"💾 Final save {session_time}s for {member.name} ({reason})")
+                    logger.info(f"💾 Final save {session_time}s for {member.name} (stopped streaming)")
                 
-                # Safe deletion with try-except
                 join_times.pop(key, None)
                 continue
             
-            # Both conditions still met - save periodic progress
+            # Still streaming - save periodic progress
             elapsed = int(asyncio.get_event_loop().time() - join_time)
             if elapsed >= 30:
                 async with db_pool.acquire() as conn:
@@ -296,7 +268,6 @@ async def save_streaming_time():
                                      last_updated = NOW()
                     ''', guild_id, user_id, elapsed)
                 
-                # Reset timer for next interval
                 join_times[key] = asyncio.get_event_loop().time()
                 logger.info(f"💾 Auto-saved {elapsed}s for {member.name}")
                 
@@ -305,15 +276,13 @@ async def save_streaming_time():
 
 @save_streaming_time.before_loop
 async def before_save_task():
-    """Wait for bot to be ready before starting save task"""
     await bot.wait_until_ready()
     logger.info("Save task initialized")
 
 @save_streaming_time.error
 async def save_task_error(error):
-    """Handle errors in save task to prevent silent failures"""
     logger.error(f"❌ save_streaming_time error: {error}")
-    await asyncio.sleep(60)  # Wait before auto-restart
+    await asyncio.sleep(60)
 
 @tasks.loop(minutes=5)
 async def auto_update_vc_roles():
@@ -326,12 +295,11 @@ async def auto_update_vc_roles():
             await update_guild_vc_roles(guild)
             logger.info(f"✅ Auto-updated VC roles for {guild.name}")
             
-            # Delay between guilds to avoid rate limits
             if len(bot.guilds) > 1:
                 await asyncio.sleep(5)
                 
         except discord.HTTPException as e:
-            if e.status == 429:  # Rate limited
+            if e.status == 429:
                 retry_after = int(e.response.headers.get('Retry-After', 60))
                 logger.warning(f"⚠️ Rate limited for {guild.name}, waiting {retry_after}s...")
                 await asyncio.sleep(retry_after)
@@ -342,15 +310,13 @@ async def auto_update_vc_roles():
 
 @auto_update_vc_roles.before_loop
 async def before_role_update():
-    """Wait for bot to be ready before starting role update task"""
     await bot.wait_until_ready()
     logger.info("Role update task initialized")
 
 @auto_update_vc_roles.error
 async def role_update_error(error):
-    """Handle errors in role update task"""
     logger.error(f"❌ auto_update_vc_roles error: {error}")
-    await asyncio.sleep(300)  # Wait 5 minutes before auto-restart
+    await asyncio.sleep(300)
 
 async def update_guild_vc_roles(guild):
     """Update VC roles for a specific guild"""
@@ -383,7 +349,6 @@ async def update_guild_vc_roles(guild):
         if not member:
             continue
         
-        # Determine target role based on rank
         target_role = None
         for role_name, threshold in reversed(ROLE_HIERARCHY):
             if threshold is None or rank <= threshold:
@@ -392,21 +357,17 @@ async def update_guild_vc_roles(guild):
         
         current_vc_roles = [r for r in member.roles if r.name in vc_role_names]
         
-        # Skip if already has correct role
         if len(current_vc_roles) == 1 and current_vc_roles[0] == target_role:
             continue
         
         try:
-            # Remove old VC roles
             if current_vc_roles:
                 await member.remove_roles(*current_vc_roles, reason="VC rank update")
             
-            # Add new role
             if target_role:
                 await member.add_roles(target_role, reason=f"Rank #{rank}")
                 updated_count += 1
                 
-            # Small delay to avoid rate limits
             await asyncio.sleep(0.5)
                 
         except discord.Forbidden:
@@ -417,7 +378,6 @@ async def update_guild_vc_roles(guild):
     if updated_count > 0:
         logger.info(f"🔄 Updated {updated_count} members in {guild.name}")
 
-# Legacy command for manual sync
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def sync(ctx):
@@ -436,11 +396,10 @@ async def sync_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You need Administrator permission to use this command!")
 
-# Slash Commands
 @bot.tree.command(name="leaderboard", description="Show streaming time leaderboard (limit: 1-20)")
 async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
     """Display top streamers by total streaming time"""
-    limit = max(1, min(limit, 20))  # Clamp between 1 and 20
+    limit = max(1, min(limit, 20))
     await interaction.response.defer()
     
     try:
@@ -454,7 +413,7 @@ async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
         return await interaction.followup.send("❌ Database error occurred. Please try again later.")
     
     if not rows:
-        return await interaction.followup.send("📊 No streaming stats yet! Start streaming with the 'Streaming stat' role to track time.")
+        return await interaction.followup.send("📊 No streaming stats yet! Start streaming to get tracked.")
     
     embed = discord.Embed(
         title=f"🎤 Top {len(rows)} Streamers",
@@ -468,7 +427,6 @@ async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
         name = user.display_name if user else f"User {row['user_id']}"
         hours = row['total_seconds'] / 3600
         
-        # Add medals for top 3
         medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"**{i}.**"
         leaderboard_text += f"{medal} {name} — **{hours:.2f}** hours\n"
     
@@ -491,7 +449,6 @@ async def stats_slash(interaction: discord.Interaction, user: discord.Member = N
                 interaction.guild.id, target_user.id
             )
             
-            # Get user's rank
             rank_row = await conn.fetchrow('''
                 SELECT COUNT(*) + 1 as rank 
                 FROM voice_time 
@@ -534,14 +491,14 @@ async def stats_slash(interaction: discord.Interaction, user: discord.Member = N
     )
     
     embed.set_thumbnail(url=target_user.display_avatar.url)
-    embed.set_footer(text="Only time spent streaming with 'Streaming stat' role counts")
+    embed.set_footer(text="Tracking all streaming activity in voice channels")
     
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="chart", description="Generate streaming time bar chart (limit: 1-15)")
 async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     """Generate visual chart of top streamers"""
-    limit = max(1, min(limit, 15))  # Clamp between 1 and 15
+    limit = max(1, min(limit, 15))
     await interaction.response.defer()
     
     try:
@@ -557,12 +514,10 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     if not rows:
         return await interaction.followup.send("📊 No streaming data available for chart!")
     
-    # Prepare data
     usernames = []
     for row in rows:
         user = interaction.guild.get_member(row['user_id'])
         if user:
-            # Truncate long names
             name = user.name[:20] + "..." if len(user.name) > 20 else user.name
             usernames.append(name)
         else:
@@ -570,7 +525,6 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     
     hours = np.array([row['total_seconds'] / 3600 for row in rows])
     
-    # Create chart
     plt.rcParams['font.family'] = 'DejaVu Sans'
     plt.rcParams['axes.unicode_minus'] = False
     
@@ -589,7 +543,6 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     ax.set_facecolor('#2C2F33')
     fig.patch.set_facecolor('#23272A')
     
-    # Add value labels
     max_hours = max(hours) if len(hours) > 0 else 1
     for i, bar in enumerate(bars):
         width = bar.get_width()
@@ -600,7 +553,6 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     
     plt.tight_layout()
     
-    # Save to bytes
     img_bytes = io.BytesIO()
     plt.savefig(img_bytes, format='PNG', bbox_inches='tight', dpi=130)
     img_bytes.seek(0)
@@ -654,16 +606,15 @@ async def resetstats_error(interaction: discord.Interaction, error):
     if isinstance(error, discord.app_commands.errors.MissingPermissions):
         await interaction.response.send_message("❌ Administrator permission required!", ephemeral=True)
 
-# CRITICAL: Start Flask BEFORE Discord bot
 if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info("Starting Discord Streaming Tracker Bot")
     logger.info("=" * 50)
     
-    keep_alive()  # Start Flask server first
+    keep_alive()
     
     try:
-        bot.run(TOKEN, log_handler=None)  # Use custom logging
+        bot.run(TOKEN, log_handler=None)
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
