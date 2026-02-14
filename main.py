@@ -32,6 +32,11 @@ def run_flask():
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 
+def keep_alive():
+    """Start Flask server in background thread"""
+    t = Thread(target=run_flask, daemon=True)
+    t.start()
+
 # Role hierarchy (order matters - higher index = higher rank)
 ROLE_HIERARCHY = [
     ("VC Rookie", None),
@@ -68,7 +73,6 @@ async def init_db():
 async def on_ready():
     print(f"Logged in as {bot.user}")
     await init_db()
-    Thread(target=run_flask, daemon=True).start()
     
     try:
         synced = await bot.tree.sync()
@@ -79,40 +83,121 @@ async def on_ready():
     save_streaming_time.start()
     auto_update_vc_roles.start()
     print("🔄 Auto-save (30s) and VC role update (5min) started")
+    print("✅ Stream LB Bot ready with dual-condition tracking (streaming + role)")
 
 join_times = {}
 
-@tasks.loop(seconds=30)
-async def save_streaming_time():
-    """Save streaming time every 30 seconds - only for users WITH 'Streaming stat' role"""
-    for key in list(join_times.keys()):
-        guild_id, user_id = key
-        if key in join_times:
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                continue
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Track streaming time ONLY when: 1) Actually streaming AND 2) Has 'Streaming stat' role"""
+    if member.bot or not member.guild:
+        return
+    
+    guild_id = member.guild.id
+    user_id = member.id
+    key = (guild_id, user_id)
+    
+    # Get the streaming stat role
+    stream_role = discord.utils.get(member.guild.roles, name=STREAM_ROLE_NAME)
+    if not stream_role:
+        return
+    
+    # Check both conditions NOW
+    is_streaming_now = after.channel is not None and after.self_stream
+    has_role_now = stream_role in member.roles
+    
+    # Check both conditions BEFORE
+    was_streaming_before = before.channel is not None and before.self_stream
+    had_role_before = stream_role in member.roles
+    
+    # Both conditions to START tracking: streaming + has role
+    should_track_now = is_streaming_now and has_role_now
+    was_tracking_before = was_streaming_before and had_role_before
+    
+    # START tracking: Both conditions met now, wasn't tracking before
+    if should_track_now and not was_tracking_before and key not in join_times:
+        join_times[key] = asyncio.get_event_loop().time()
+        print(f"▶️ Started tracking {member.name} (streaming + has role in {after.channel.name})")
+    
+    # STOP tracking: Either condition lost (stopped streaming OR role removed)
+    elif was_tracking_before and not should_track_now and key in join_times:
+        session_time = int(asyncio.get_event_loop().time() - join_times[key])
+        
+        # Only save if more than 5 seconds (avoid false triggers)
+        if session_time >= 5:
+            print(f"💾 Saving {session_time}s for {member.name}...")
             
-            member = guild.get_member(user_id)
-            if not member:
-                continue
-            
-            stream_role = discord.utils.get(guild.roles, name=STREAM_ROLE_NAME)
-            if not stream_role or stream_role not in member.roles:
-                del join_times[key]
-                print(f"⏹️ Stopped tracking {member.name} (no Streaming stat role)")
-                continue
-            
-            elapsed = int(asyncio.get_event_loop().time() - join_times[key])
-            if elapsed >= 30:
+            try:
                 async with db_pool.acquire() as conn:
                     await conn.execute('''
                         INSERT INTO voice_time (guild_id, user_id, total_seconds) 
                         VALUES ($1, $2, $3)
                         ON CONFLICT (guild_id, user_id) 
                         DO UPDATE SET total_seconds = voice_time.total_seconds + $3
-                    ''', guild_id, user_id, elapsed)
-                join_times[key] = asyncio.get_event_loop().time()
-                print(f"💾 Auto-saved {elapsed}s for user {user_id}")
+                    ''', guild_id, user_id, session_time)
+                print(f"✅ Successfully saved {session_time}s for {member.name}")
+            except Exception as e:
+                print(f"❌ Database save error for {member.name}: {e}")
+        else:
+            print(f"⏭️ Skipped {session_time}s for {member.name} (too short)")
+        
+        del join_times[key]
+        reason = "stopped streaming" if not is_streaming_now else "role removed"
+        print(f"⏹️ Stopped tracking {member.name} ({reason})")
+
+@tasks.loop(seconds=30)
+async def save_streaming_time():
+    """Save streaming time every 30 seconds - ONLY for users actively streaming WITH role"""
+    for key in list(join_times.keys()):
+        guild_id, user_id = key
+        if key not in join_times:
+            continue
+            
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+        
+        member = guild.get_member(user_id)
+        if not member:
+            continue
+        
+        # Get the streaming stat role
+        stream_role = discord.utils.get(guild.roles, name=STREAM_ROLE_NAME)
+        if not stream_role:
+            continue
+        
+        # Check BOTH conditions: streaming + has role
+        is_streaming = member.voice and member.voice.self_stream
+        has_role = stream_role in member.roles
+        
+        # If either condition is lost, save final time and stop tracking
+        if not is_streaming or not has_role:
+            session_time = int(asyncio.get_event_loop().time() - join_times[key])
+            if session_time >= 5:
+                async with db_pool.acquire() as conn:
+                    await conn.execute('''
+                        INSERT INTO voice_time (guild_id, user_id, total_seconds) 
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (guild_id, user_id) 
+                        DO UPDATE SET total_seconds = voice_time.total_seconds + $3
+                    ''', guild_id, user_id, session_time)
+                reason = "not streaming" if not is_streaming else "role removed"
+                print(f"💾 Final save {session_time}s for {member.name} ({reason})")
+            del join_times[key]
+            continue
+        
+        # Both conditions still met - save periodic progress
+        elapsed = int(asyncio.get_event_loop().time() - join_times[key])
+        if elapsed >= 30:
+            async with db_pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO voice_time (guild_id, user_id, total_seconds) 
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (guild_id, user_id) 
+                    DO UPDATE SET total_seconds = voice_time.total_seconds + $3
+                ''', guild_id, user_id, elapsed)
+            join_times[key] = asyncio.get_event_loop().time()
+            print(f"💾 Auto-saved {elapsed}s for {member.name}")
 
 @tasks.loop(minutes=5)
 async def auto_update_vc_roles():
@@ -193,49 +278,6 @@ async def update_guild_vc_roles(guild):
     
     if updated_count > 0:
         print(f"🔄 Updated {updated_count} members in {guild.name}")
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    """Track streaming time ONLY when 'Streaming stat' role is present"""
-    if member.bot or not member.guild:
-        return
-    
-    guild_id = member.guild.id
-    user_id = member.id
-    key = (guild_id, user_id)
-    
-    stream_role = discord.utils.get(member.guild.roles, name=STREAM_ROLE_NAME)
-    if not stream_role:
-        print(f"⚠️ 'Streaming stat' role not found in {member.guild.name}")
-        return
-    
-    # Check if member has the streaming stat role
-    has_role_now = stream_role in member.roles
-    
-    # User joined voice channel OR got role - start tracking if they have the role and in voice
-    if has_role_now and key not in join_times and after.channel:
-        join_times[key] = asyncio.get_event_loop().time()
-        print(f"▶️ Started tracking {member.name} (has Streaming stat role in {after.channel.name})")
-    
-    # User left voice channel OR lost role - save and stop tracking
-    elif key in join_times and (not after.channel or not has_role_now):
-        session_time = int(asyncio.get_event_loop().time() - join_times[key])
-        print(f"💾 Saving {session_time}s for {member.name}...")
-        
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute('''
-                    INSERT INTO voice_time (guild_id, user_id, total_seconds) 
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (guild_id, user_id) 
-                    DO UPDATE SET total_seconds = voice_time.total_seconds + $3
-                ''', guild_id, user_id, session_time)
-            print(f"✅ Successfully saved {session_time}s for {member.name}")
-        except Exception as e:
-            print(f"❌ Database save error for {member.name}: {e}")
-        
-        del join_times[key]
-        print(f"⏹️ Stopped tracking {member.name}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -407,4 +449,7 @@ async def updateroles_error(interaction: discord.Interaction, error):
     if isinstance(error, discord.app_commands.errors.MissingPermissions):
         await interaction.response.send_message("❌ Admin only!", ephemeral=True)
 
-bot.run(TOKEN)
+# CRITICAL: Start Flask BEFORE Discord bot
+if __name__ == "__main__":
+    keep_alive()  # ← Start Flask first!
+    bot.run(TOKEN)
