@@ -1,5 +1,5 @@
 discord.py==2.3.2
 asyncpg==0.29.0
-matplotlib==3.8.2
-numpy==1.26.3
 flask==3.0.0
+matplotlib==3.8.2
+numpy==1.26.2
