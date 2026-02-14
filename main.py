@@ -112,7 +112,7 @@ async def save_streaming_time():
                         DO UPDATE SET total_seconds = voice_time.total_seconds + $3
                     ''', guild_id, user_id, elapsed)
                 join_times[key] = asyncio.get_event_loop().time()
-                print(f"Auto-saved {elapsed}s for user {user_id}")
+                print(f"💾 Auto-saved {elapsed}s for user {user_id}")
 
 @tasks.loop(minutes=5)
 async def auto_update_vc_roles():
@@ -206,19 +206,22 @@ async def on_voice_state_update(member, before, after):
     
     stream_role = discord.utils.get(member.guild.roles, name=STREAM_ROLE_NAME)
     if not stream_role:
+        print(f"⚠️ 'Streaming stat' role not found in {member.guild.name}")
         return
     
-    # Check if "Streaming stat" role is currently on the member
+    # Check if member has the streaming stat role
     has_role_now = stream_role in member.roles
     
-    # Someone just joined voice or changed state - check if they have the role and should be tracked
+    # User joined voice channel OR got role - start tracking if they have the role and in voice
     if has_role_now and key not in join_times and after.channel:
         join_times[key] = asyncio.get_event_loop().time()
-        print(f"▶️ Started tracking {member.name} (has Streaming stat role)")
+        print(f"▶️ Started tracking {member.name} (has Streaming stat role in {after.channel.name})")
     
-    # Member left voice channel or disconnected - save if they were being tracked
+    # User left voice channel OR lost role - save and stop tracking
     elif key in join_times and (not after.channel or not has_role_now):
         session_time = int(asyncio.get_event_loop().time() - join_times[key])
+        print(f"💾 Saving {session_time}s for {member.name}...")
+        
         try:
             async with db_pool.acquire() as conn:
                 await conn.execute('''
@@ -227,9 +230,10 @@ async def on_voice_state_update(member, before, after):
                     ON CONFLICT (guild_id, user_id) 
                     DO UPDATE SET total_seconds = voice_time.total_seconds + $3
                 ''', guild_id, user_id, session_time)
-            print(f"✅ Saved {session_time}s for {member.name}")
+            print(f"✅ Successfully saved {session_time}s for {member.name}")
         except Exception as e:
-            print(f"❌ Database save error: {e}")
+            print(f"❌ Database save error for {member.name}: {e}")
+        
         del join_times[key]
         print(f"⏹️ Stopped tracking {member.name}")
 
