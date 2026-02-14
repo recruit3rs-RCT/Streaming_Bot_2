@@ -4,17 +4,16 @@ import os
 import io
 from flask import Flask
 from threading import Thread
-import aiosqlite
+import asyncpg
 import asyncio
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
-from datetime import timedelta
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 STREAM_ROLE_NAME = "Streaming stat"
-DB_PATH = os.getenv('DB_PATH', 'voice_stats.db')
+DATABASE_URL = os.getenv('DATABASE_URL')
 
 intents = discord.Intents.default()
 intents.members = True
@@ -33,17 +32,37 @@ def run_flask():
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 
+# Role hierarchy (order matters - higher index = higher rank)
+ROLE_HIERARCHY = [
+    ("VC Rookie", None),           # Everyone with streaming time
+    ("VC Raider", 50),             # Top 50
+    ("VC Challenger", 40),         # Top 40
+    ("VC Elite", 30),              # Top 30
+    ("VC Legend", 20),             # Top 20
+    ("VC Top Contender", 10),      # Top 10
+    ("VC Finalist", 5),            # Top 5
+    ("VC Champ", 3),               # Top 3
+    ("VC MVP", 2),                 # Top 2
+    ("Apex Speaker", 1)            # Top 1
+]
+
+# Database connection pool
+db_pool = None
+
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS voice_time (
-                guild_id INTEGER,
-                user_id INTEGER,
+                guild_id BIGINT,
+                user_id BIGINT,
                 total_seconds INTEGER DEFAULT 0,
                 PRIMARY KEY (guild_id, user_id)
             )
         ''')
-        await db.commit()
+    print("✅ Database initialized")
 
 @bot.event
 async def on_ready():
@@ -58,28 +77,126 @@ async def on_ready():
         print(f"Failed to sync commands: {e}")
     
     save_streaming_time.start()
+    auto_update_vc_roles.start()
+    print("🔄 Auto-save (30s) and VC role update (5min) started")
 
 join_times = {}
 
 @tasks.loop(seconds=30)
 async def save_streaming_time():
-    """Save streaming time every 30 seconds for active streamers"""
+    """Save streaming time every 30 seconds - only for users WITH 'Streaming stat' role"""
     for key in list(join_times.keys()):
         guild_id, user_id = key
         if key in join_times:
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+            
+            member = guild.get_member(user_id)
+            if not member:
+                continue
+            
+            stream_role = discord.utils.get(guild.roles, name=STREAM_ROLE_NAME)
+            if not stream_role or stream_role not in member.roles:
+                del join_times[key]
+                print(f"⏹️ Stopped tracking {member.name} (no Streaming stat role)")
+                continue
+            
             elapsed = int(asyncio.get_event_loop().time() - join_times[key])
             if elapsed >= 30:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute('''
-                        INSERT OR REPLACE INTO voice_time (guild_id, user_id, total_seconds) 
-                        VALUES (?, ?, COALESCE((SELECT total_seconds FROM voice_time WHERE guild_id=? AND user_id=?), 0) + ?)
-                    ''', (guild_id, user_id, guild_id, user_id, elapsed))
-                    await db.commit()
+                async with db_pool.acquire() as conn:
+                    await conn.execute('''
+                        INSERT INTO voice_time (guild_id, user_id, total_seconds) 
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (guild_id, user_id) 
+                        DO UPDATE SET total_seconds = voice_time.total_seconds + $3
+                    ''', guild_id, user_id, elapsed)
                 join_times[key] = asyncio.get_event_loop().time()
                 print(f"Auto-saved {elapsed}s for user {user_id}")
 
+@tasks.loop(minutes=5)
+async def auto_update_vc_roles():
+    """Auto-update VC rank roles every 5 minutes"""
+    await bot.wait_until_ready()
+    
+    for guild in bot.guilds:
+        try:
+            await update_guild_vc_roles(guild)
+            print(f"✅ Auto-updated VC roles for {guild.name}")
+            
+            if len(bot.guilds) > 1:
+                await asyncio.sleep(2)
+                
+        except discord.HTTPException as e:
+            if e.status == 429:
+                print(f"⚠️ Rate limited for {guild.name}, waiting 60s...")
+                await asyncio.sleep(60)
+            else:
+                print(f"❌ HTTP Error for {guild.name}: {e}")
+        except Exception as e:
+            print(f"❌ Error updating {guild.name}: {e}")
+
+async def update_guild_vc_roles(guild):
+    """Update VC roles for a specific guild"""
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT user_id, total_seconds FROM voice_time WHERE guild_id=$1 ORDER BY total_seconds DESC',
+                guild.id
+            )
+    except Exception as e:
+        print(f"❌ Database error for {guild.name}: {e}")
+        return
+    
+    if not rows:
+        print(f"⚠️ No streaming data for {guild.name}")
+        return
+    
+    guild_roles = {role.name: role for role in guild.roles}
+    vc_role_names = [name for name, _ in ROLE_HIERARCHY]
+    
+    missing_roles = [name for name in vc_role_names if name not in guild_roles]
+    if missing_roles:
+        print(f"⚠️ {guild.name} missing roles: {', '.join(missing_roles)}")
+        return
+    
+    updated_count = 0
+    
+    for rank, row in enumerate(rows, 1):
+        member = guild.get_member(row['user_id'])
+        if not member:
+            continue
+        
+        target_role = None
+        for role_name, threshold in reversed(ROLE_HIERARCHY):
+            if threshold is None or rank <= threshold:
+                target_role = guild_roles[role_name]
+                break
+        
+        current_vc_roles = [r for r in member.roles if r.name in vc_role_names]
+        
+        if len(current_vc_roles) == 1 and current_vc_roles[0] == target_role:
+            continue
+        
+        try:
+            if current_vc_roles:
+                await member.remove_roles(*current_vc_roles, reason="VC rank update")
+            
+            if target_role:
+                await member.add_roles(target_role, reason=f"Rank #{rank}")
+                updated_count += 1
+                
+        except discord.Forbidden:
+            print(f"⚠️ No permission to update {member.name} in {guild.name}")
+        except Exception as e:
+            print(f"❌ Error updating {member.name}: {e}")
+    
+    if updated_count > 0:
+        print(f"🔄 Updated {updated_count} members in {guild.name}")
+
 @bot.event
 async def on_voice_state_update(member, before, after):
+    """Track streaming time ONLY when 'Streaming stat' role is present"""
     if member.bot or not member.guild:
         return
         
@@ -87,44 +204,44 @@ async def on_voice_state_update(member, before, after):
     user_id = member.id
     key = (guild_id, user_id)
     
-    role = discord.utils.get(member.guild.roles, name=STREAM_ROLE_NAME)
-    if not role:
+    stream_role = discord.utils.get(member.guild.roles, name=STREAM_ROLE_NAME)
+    if not stream_role:
         return
     
-    if after.self_stream and not before.self_stream and role not in member.roles:
-        try:
-            await member.add_roles(role, reason="Started streaming")
-            print(f"Added {role.name} to {member}")
-            join_times[key] = asyncio.get_event_loop().time()
-        except Exception as e:
-            print(f"Role add error: {e}")
+    if stream_role in after.roles and stream_role not in before.roles and after.self_stream:
+        join_times[key] = asyncio.get_event_loop().time()
+        print(f"▶️ Started tracking {member.name} (Streaming stat role added)")
     
-    elif before.self_stream and (not after.self_stream or after.channel is None) and role in member.roles:
-        try:
-            await member.remove_roles(role, reason="Stopped streaming/disconnected")
-            print(f"Removed {role.name} from {member}")
-            if key in join_times:
-                session_time = int(asyncio.get_event_loop().time() - join_times[key])
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute('''
-                        INSERT OR REPLACE INTO voice_time (guild_id, user_id, total_seconds) 
-                        VALUES (?, ?, COALESCE((SELECT total_seconds FROM voice_time WHERE guild_id=? AND user_id=?), 0) + ?)
-                    ''', (guild_id, user_id, guild_id, user_id, session_time))
-                    await db.commit()
-                del join_times[key]
-                print(f"Saved {session_time}s streaming time for {member}")
-        except Exception as e:
-            print(f"Role remove error: {e}")
+    elif stream_role in before.roles and (stream_role not in after.roles or not after.self_stream):
+        if key in join_times:
+            session_time = int(asyncio.get_event_loop().time() - join_times[key])
+            async with db_pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO voice_time (guild_id, user_id, total_seconds) 
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (guild_id, user_id) 
+                    DO UPDATE SET total_seconds = voice_time.total_seconds + $3
+                ''', guild_id, user_id, session_time)
+            del join_times[key]
+            print(f"⏹️ Stopped tracking {member.name} - Saved {session_time}s")
 
 @bot.command()
-@commands.is_owner()
+@commands.has_permissions(administrator=True)
 async def sync(ctx):
-    """Manual sync command (owner only)"""
+    """Force sync slash commands (Administrator only)"""
     try:
-        synced = await bot.tree.sync()
-        await ctx.send(f"✅ Synced {len(synced)} global slash commands!")
+        synced = await bot.tree.sync(guild=ctx.guild)
+        await ctx.send(f"✅ Synced {len(synced)} commands to this server!")
+        
+        synced_global = await bot.tree.sync()
+        await ctx.send(f"✅ Also synced {len(synced_global)} commands globally (may take 1 hour)")
     except Exception as e:
         await ctx.send(f"❌ Sync failed: {e}")
+
+@sync.error
+async def sync_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You need Administrator permission to use this command!")
 
 @bot.tree.command(name="leaderboard", description="Show streaming time leaderboard (limit: 1-20)")
 async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
@@ -132,9 +249,11 @@ async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
         limit = 10
     await interaction.response.defer()
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id, total_seconds FROM voice_time WHERE guild_id=? ORDER BY total_seconds DESC LIMIT ?', (interaction.guild.id, limit)) as cursor:
-            rows = await cursor.fetchall()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            'SELECT user_id, total_seconds FROM voice_time WHERE guild_id=$1 ORDER BY total_seconds DESC LIMIT $2',
+            interaction.guild.id, limit
+        )
     
     if not rows:
         return await interaction.followup.send("No streaming stats yet! Start streaming to track time.")
@@ -142,10 +261,10 @@ async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
     embed = discord.Embed(title=f"🎤 Top {limit} Streamers", color=0x5865F2)
     
     leaderboard_text = ""
-    for i, (user_id, secs) in enumerate(rows, 1):
-        user = interaction.guild.get_member(user_id)
-        name = user.display_name if user else f"ID {user_id}"
-        hours = secs / 3600
+    for i, row in enumerate(rows, 1):
+        user = interaction.guild.get_member(row['user_id'])
+        name = user.display_name if user else f"ID {row['user_id']}"
+        hours = row['total_seconds'] / 3600
         leaderboard_text += f"**{i}.** {name} — **{hours:.2f}** *hours*\n"
     
     embed.description = leaderboard_text
@@ -159,14 +278,16 @@ async def stats_slash(interaction: discord.Interaction, limit: int = 10):
         limit = 10
     await interaction.response.defer()
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id, total_seconds FROM voice_time WHERE guild_id=? ORDER BY total_seconds DESC LIMIT ?', (interaction.guild.id, limit)) as cursor:
-            rows = await cursor.fetchall()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            'SELECT user_id, total_seconds FROM voice_time WHERE guild_id=$1 ORDER BY total_seconds DESC LIMIT $2',
+            interaction.guild.id, limit
+        )
     
     if not rows:
         return await interaction.followup.send("No streaming data!")
     
-    total_secs = sum([s for _, s in rows])
+    total_secs = sum([row['total_seconds'] for row in rows])
     
     embed = discord.Embed(title="🔊 Streaming Activity", color=0x5865F2)
     
@@ -187,10 +308,10 @@ async def stats_slash(interaction: discord.Interaction, limit: int = 10):
     )
     
     top_text = ""
-    for i, (user_id, secs) in enumerate(rows[:5], 1):
-        user = interaction.guild.get_member(user_id)
-        name = user.display_name if user else f"ID{user_id}"
-        hours = secs / 3600
+    for i, row in enumerate(rows[:5], 1):
+        user = interaction.guild.get_member(row['user_id'])
+        name = user.display_name if user else f"ID{row['user_id']}"
+        hours = row['total_seconds'] / 3600
         top_text += f"**{name}** {hours:.2f} *hours*\n"
     
     embed.add_field(
@@ -207,23 +328,24 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
         limit = 10
     await interaction.response.defer()
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id, total_seconds FROM voice_time WHERE guild_id=? ORDER BY total_seconds DESC LIMIT ?', (interaction.guild.id, limit)) as cursor:
-            rows = await cursor.fetchall()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            'SELECT user_id, total_seconds FROM voice_time WHERE guild_id=$1 ORDER BY total_seconds DESC LIMIT $2',
+            interaction.guild.id, limit
+        )
     
     if not rows:
         return await interaction.followup.send("No streaming data for chart!")
     
-    # Use Discord username (e.g., tox_185) instead of display name
     usernames = []
-    for uid, _ in rows:
-        user = interaction.guild.get_member(uid)
+    for row in rows:
+        user = interaction.guild.get_member(row['user_id'])
         if user:
-            usernames.append(user.name)  # Discord username, not display_name
+            usernames.append(user.name)
         else:
-            usernames.append(f"ID{uid}")
+            usernames.append(f"ID{row['user_id']}")
     
-    hours = np.array([t / 3600 for _, t in rows])
+    hours = np.array([row['total_seconds'] / 3600 for row in rows])
     
     plt.rcParams['font.family'] = 'DejaVu Sans'
     plt.rcParams['axes.unicode_minus'] = False
@@ -256,5 +378,21 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     file = discord.File(img_bytes, 'streaming_chart.png')
     await interaction.followup.send("📊 **Streaming Time Chart**", file=file)
     plt.close(fig)
+
+@bot.tree.command(name="updateroles", description="Manually update VC rank roles (Admin only)")
+@discord.app_commands.checks.has_permissions(administrator=True)
+async def updateroles_slash(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
+    try:
+        await update_guild_vc_roles(interaction.guild)
+        await interaction.followup.send("✅ VC roles updated successfully!")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)[:100]}")
+
+@updateroles_slash.error
+async def updateroles_error(interaction: discord.Interaction, error):
+    if isinstance(error, discord.app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
 
 bot.run(TOKEN)
