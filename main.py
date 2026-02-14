@@ -34,16 +34,16 @@ def run_flask():
 
 # Role hierarchy (order matters - higher index = higher rank)
 ROLE_HIERARCHY = [
-    ("VC Rookie", None),           # Everyone with streaming time
-    ("VC Raider", 50),             # Top 50
-    ("VC Challenger", 40),         # Top 40
-    ("VC Elite", 30),              # Top 30
-    ("VC Legend", 20),             # Top 20
-    ("VC Top Contender", 10),      # Top 10
-    ("VC Finalist", 5),            # Top 5
-    ("VC Champ", 3),               # Top 3
-    ("VC MVP", 2),                 # Top 2
-    ("Apex Speaker", 1)            # Top 1
+    ("VC Rookie", None),
+    ("VC Raider", 50),
+    ("VC Challenger", 40),
+    ("VC Elite", 30),
+    ("VC Legend", 20),
+    ("VC Top Contender", 10),
+    ("VC Finalist", 5),
+    ("VC Champ", 3),
+    ("VC MVP", 2),
+    ("Apex Speaker", 1)
 ]
 
 # Database connection pool
@@ -199,7 +199,7 @@ async def on_voice_state_update(member, before, after):
     """Track streaming time ONLY when 'Streaming stat' role is present"""
     if member.bot or not member.guild:
         return
-        
+    
     guild_id = member.guild.id
     user_id = member.id
     key = (guild_id, user_id)
@@ -208,15 +208,18 @@ async def on_voice_state_update(member, before, after):
     if not stream_role:
         return
     
-    # Role was just added - start tracking
-    if stream_role in after.roles and stream_role not in before.roles:
-        join_times[key] = asyncio.get_event_loop().time()
-        print(f"▶️ Started tracking {member.name} (Streaming stat role added)")
+    # Check if "Streaming stat" role is currently on the member
+    has_role_now = stream_role in member.roles
     
-    # Role was just removed - stop tracking and save
-    elif stream_role in before.roles and stream_role not in after.roles:
-        if key in join_times:
-            session_time = int(asyncio.get_event_loop().time() - join_times[key])
+    # Someone just joined voice or changed state - check if they have the role and should be tracked
+    if has_role_now and key not in join_times and after.channel:
+        join_times[key] = asyncio.get_event_loop().time()
+        print(f"▶️ Started tracking {member.name} (has Streaming stat role)")
+    
+    # Member left voice channel or disconnected - save if they were being tracked
+    elif key in join_times and (not after.channel or not has_role_now):
+        session_time = int(asyncio.get_event_loop().time() - join_times[key])
+        try:
             async with db_pool.acquire() as conn:
                 await conn.execute('''
                     INSERT INTO voice_time (guild_id, user_id, total_seconds) 
@@ -224,8 +227,11 @@ async def on_voice_state_update(member, before, after):
                     ON CONFLICT (guild_id, user_id) 
                     DO UPDATE SET total_seconds = voice_time.total_seconds + $3
                 ''', guild_id, user_id, session_time)
-            del join_times[key]
-            print(f"⏹️ Stopped tracking {member.name} - Saved {session_time}s")
+            print(f"✅ Saved {session_time}s for {member.name}")
+        except Exception as e:
+            print(f"❌ Database save error: {e}")
+        del join_times[key]
+        print(f"⏹️ Stopped tracking {member.name}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
