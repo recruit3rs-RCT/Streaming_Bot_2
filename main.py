@@ -208,11 +208,13 @@ async def on_voice_state_update(member, before, after):
     if not stream_role:
         return
     
-    if stream_role in after.roles and stream_role not in before.roles and after.self_stream:
+    # Role was just added - start tracking
+    if stream_role in after.roles and stream_role not in before.roles:
         join_times[key] = asyncio.get_event_loop().time()
         print(f"▶️ Started tracking {member.name} (Streaming stat role added)")
     
-    elif stream_role in before.roles and (stream_role not in after.roles or not after.self_stream):
+    # Role was just removed - stop tracking and save
+    elif stream_role in before.roles and stream_role not in after.roles:
         if key in join_times:
             session_time = int(asyncio.get_event_loop().time() - join_times[key])
             async with db_pool.acquire() as conn:
