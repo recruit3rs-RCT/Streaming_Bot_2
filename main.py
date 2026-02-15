@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 
 # ========== CONFIG ==========
-TOKEN = "YOUR_BOT_TOKEN"
+TOKEN = "MTQ3MTkyODE5MTI0ODYyOTg4Mw.G4qEKB.40rCmQUN8nGKjOBmRLT2fII0oxUd4ijXAvUCo0"
 COG_DIR = "./cogs"
 # ============================
 
