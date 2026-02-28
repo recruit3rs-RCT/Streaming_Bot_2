@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import os
 import io
+import sys
 import time
 import random
 from flask import Flask
@@ -72,16 +73,16 @@ def keep_alive():
 #   2. Server Settings → Roles → Right-click role → Copy Role ID
 # ================================================================
 ROLE_HIERARCHY = [
-    (1477355642271305749, None),   # VC Rookie        — everyone else
-    (1477355709522903081, 50),     # VC Raider        — top 50
-    (1477355810433794088, 40),     # VC Challenger    — top 40
-    (1477355846970114118, 30),     # VC Elite         — top 30
-    (1477355913961537577, 20),     # VC Legend        — top 20
-    (1477356047319695411, 10),     # VC Top Contender — top 10
-    (1477356099484127354, 5),      # VC Finalist      — top 5
-    (1477356210528321670, 3),      # VC Champ         — top 3
-    (1477356266945777828, 2),      # VC MVP           — top 2
-    (1477356310059290767, 1),      # Apex Speaker     — #1 only
+    (123456789012345678, None),   # VC Rookie        — everyone else
+    (123456789012345679, 50),     # VC Raider        — top 50
+    (123456789012345680, 40),     # VC Challenger    — top 40
+    (123456789012345681, 30),     # VC Elite         — top 30
+    (123456789012345682, 20),     # VC Legend        — top 20
+    (123456789012345683, 10),     # VC Top Contender — top 10
+    (123456789012345684, 5),      # VC Finalist      — top 5
+    (123456789012345685, 3),      # VC Champ         — top 3
+    (123456789012345686, 2),      # VC MVP           — top 2
+    (123456789012345687, 1),      # Apex Speaker     — #1 only
 ]
 
 # Set of all VC role IDs for quick membership checks
@@ -257,7 +258,7 @@ async def save_streaming_time():
                             DO UPDATE SET total_seconds = voice_time.total_seconds + $3,
                                          last_updated = NOW()
                         ''', guild_id, user_id, session_time)
-                    logger.info(f"💾 Final save {session_time}s for {member.name} (stopped streaming)")
+                    logger.info(f"💾 Final save {session_time}s for {member.name}")
 
                 join_times.pop(key, None)
                 continue
@@ -400,7 +401,6 @@ async def sync(ctx):
     try:
         synced = await bot.tree.sync(guild=ctx.guild)
         await ctx.send(f"✅ Synced {len(synced)} commands to this server!")
-
         synced_global = await bot.tree.sync()
         await ctx.send(f"✅ Also synced {len(synced_global)} commands globally (may take up to 1 hour)")
     except Exception as e:
@@ -445,7 +445,6 @@ async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
 
     embed.description = leaderboard_text
     embed.set_footer(text=f"Total tracked streamers: {len(rows)} | Refreshes every 30s")
-
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="stats", description="View your personal streaming statistics")
@@ -460,7 +459,6 @@ async def stats_slash(interaction: discord.Interaction, user: discord.Member = N
                 'SELECT total_seconds, last_updated FROM voice_time WHERE guild_id=$1 AND user_id=$2',
                 interaction.guild.id, target_user.id
             )
-
             rank_row = await conn.fetchrow('''
                 SELECT COUNT(*) + 1 as rank
                 FROM voice_time
@@ -471,7 +469,6 @@ async def stats_slash(interaction: discord.Interaction, user: discord.Member = N
                     )
                 )
             ''', interaction.guild.id, target_user.id)
-
     except Exception as e:
         logger.error(f"Database error in stats: {e}")
         return await interaction.followup.send("❌ Database error occurred.")
@@ -495,7 +492,6 @@ async def stats_slash(interaction: discord.Interaction, user: discord.Member = N
     )
     embed.set_thumbnail(url=target_user.display_avatar.url)
     embed.set_footer(text="Tracking all streaming activity in voice channels")
-
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="chart", description="Generate streaming time bar chart (limit: 1-15)")
@@ -558,7 +554,6 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     plt.savefig(img_bytes, format='PNG', bbox_inches='tight', dpi=130)
     img_bytes.seek(0)
     file = discord.File(img_bytes, 'streaming_chart.png')
-
     await interaction.followup.send("📊 **Streaming Time Chart**", file=file)
     plt.close(fig)
 
@@ -602,7 +597,7 @@ async def resetstats_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ Administrator permission required!", ephemeral=True)
 
 # ================================================================
-# ENTRY POINT — Exponential backoff on rate limits
+# ENTRY POINT — Process restart on rate limit (fixes session closed)
 # ================================================================
 if __name__ == "__main__":
     logger.info("=" * 50)
@@ -611,37 +606,38 @@ if __name__ == "__main__":
 
     keep_alive()
 
-    # Random startup jitter — prevents synchronized reconnects on Render
+    # Random startup jitter on first launch only
     startup_delay = random.uniform(2, 8)
     logger.info(f"Waiting {startup_delay:.1f}s before connecting...")
     time.sleep(startup_delay)
 
     max_retries = 5
-    base_delay = 30  # seconds
+    base_delay = 30
 
     for attempt in range(max_retries):
         try:
             logger.info(f"Connection attempt {attempt + 1}/{max_retries}")
             bot.run(TOKEN, log_handler=None, reconnect=True)
-            break  # Clean exit — stop retrying
+            break  # Clean exit — don't retry
 
         except discord.errors.HTTPException as e:
             if e.status == 429:
                 wait_time = base_delay * (2 ** attempt) + random.uniform(0, 10)
-                logger.error(f"❌ Rate limited by Discord (429). Waiting {wait_time:.0f}s before retry...")
+                logger.error(f"❌ Rate limited (429). Waiting {wait_time:.0f}s then restarting process...")
                 time.sleep(wait_time)
+                # Full process restart — solves "Session is closed" error
+                os.execv(sys.executable, [sys.executable] + sys.argv)
             else:
                 logger.error(f"❌ HTTP error {e.status}: {e}")
                 time.sleep(base_delay)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
 
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
             break
 
         except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = base_delay * (2 ** attempt) + random.uniform(0, 10)
-                logger.error(f"❌ Fatal error: {e} — retrying in {wait_time:.0f}s...")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"❌ Max retries reached. Last error: {e}")
+            wait_time = base_delay * (2 ** attempt) + random.uniform(0, 10)
+            logger.error(f"❌ Error: {e} — restarting in {wait_time:.0f}s...")
+            time.sleep(wait_time)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
