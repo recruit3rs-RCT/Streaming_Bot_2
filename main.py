@@ -2,7 +2,6 @@ import discord
 from discord.ext import commands, tasks
 import os
 import io
-import sys
 import time
 import random
 from flask import Flask
@@ -26,7 +25,6 @@ logger = logging.getLogger('StreamBot')
 TOKEN = os.getenv('DISCORD_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-# Validate environment variables
 if not TOKEN:
     logger.error("DISCORD_TOKEN not found in environment variables!")
     exit(1)
@@ -65,7 +63,7 @@ def keep_alive():
     logger.info(f"Flask server started on port {os.getenv('PORT', 10000)}")
 
 # ================================================================
-# ROLE HIERARCHY — Replace with your actual Role IDs from Discord
+# ROLE HIERARCHY — Your actual server role IDs
 # ================================================================
 ROLE_HIERARCHY = [
     (1477355642271305749, None),   # VC Rookie        — everyone else
@@ -459,7 +457,10 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     usernames = []
     for row in rows:
         user = interaction.guild.get_member(row['user_id'])
-        name = (user.name[:20] + "...") if user and len(user.name) > 20 else (user.name if user else f"User{row['user_id']}")
+        if user:
+            name = (user.name[:20] + "...") if len(user.name) > 20 else user.name
+        else:
+            name = f"User{row['user_id']}"
         usernames.append(name)
 
     hours = np.array([row['total_seconds'] / 3600 for row in rows])
@@ -474,7 +475,8 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
     ax.set_yticks(y_pos)
     ax.set_yticklabels(usernames, fontsize=11, family='monospace')
     ax.set_xlabel('Hours Streaming', fontsize=13, fontweight='bold')
-    ax.set_title(f'🎥 {interaction.guild.name} - Top {limit} Streamers', fontsize=16, fontweight='bold', pad=20)
+    ax.set_title(f'🎥 {interaction.guild.name} - Top {limit} Streamers',
+                 fontsize=16, fontweight='bold', pad=20)
     ax.grid(axis='x', alpha=0.25, linestyle='--')
     ax.set_facecolor('#2C2F33')
     fig.patch.set_facecolor('#23272A')
@@ -484,13 +486,15 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
         width = bar.get_width()
         if width > 0:
             ax.text(width + max_hours * 0.015, bar.get_y() + bar.get_height() / 2,
-                    f'{hours[i]:.2f}h', ha='left', va='center', color='white', fontsize=10, fontweight='bold')
+                    f'{hours[i]:.2f}h', ha='left', va='center',
+                    color='white', fontsize=10, fontweight='bold')
 
     plt.tight_layout()
     img_bytes = io.BytesIO()
     plt.savefig(img_bytes, format='PNG', bbox_inches='tight', dpi=130)
     img_bytes.seek(0)
-    await interaction.followup.send("📊 **Streaming Time Chart**", file=discord.File(img_bytes, 'streaming_chart.png'))
+    await interaction.followup.send("📊 **Streaming Time Chart**",
+                                     file=discord.File(img_bytes, 'streaming_chart.png'))
     plt.close(fig)
 
 @bot.tree.command(name="updateroles", description="Manually update VC rank roles (Admin only)")
@@ -531,52 +535,30 @@ async def resetstats_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ Administrator permission required!", ephemeral=True)
 
 # ================================================================
-# ENTRY POINT
-# Key fix: FLASK_STARTED env var prevents port conflict on restart
-# os.execv restarts the process fresh — fixes "Session is closed"
+# ENTRY POINT — Simple and clean, let Render handle restarts
 # ================================================================
 if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info("Starting Discord Streaming Tracker Bot")
     logger.info("=" * 50)
 
-    # Only start Flask on the FIRST launch, not on os.execv restarts
-    # This prevents "Address already in use" error on retry
-    if not os.getenv('FLASK_STARTED'):
-        os.environ['FLASK_STARTED'] = '1'
-        keep_alive()
-        startup_delay = random.uniform(2, 8)
-        logger.info(f"Waiting {startup_delay:.1f}s before connecting...")
-        time.sleep(startup_delay)
-    else:
-        logger.info("Process restarted — Flask already running, skipping...")
+    keep_alive()
 
-    max_retries = 5
-    base_delay = 30
+    startup_delay = random.uniform(5, 15)
+    logger.info(f"Waiting {startup_delay:.1f}s before connecting...")
+    time.sleep(startup_delay)
 
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Connection attempt {attempt + 1}/{max_retries}")
-            bot.run(TOKEN, log_handler=None, reconnect=True)
-            break
-
-        except discord.errors.HTTPException as e:
-            if e.status == 429:
-                wait_time = base_delay * (2 ** attempt) + random.uniform(0, 10)
-                logger.error(f"❌ Rate limited (429). Waiting {wait_time:.0f}s then restarting...")
-                time.sleep(wait_time)
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            else:
-                logger.error(f"❌ HTTP error {e.status}: {e}")
-                time.sleep(base_delay)
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            break
-
-        except Exception as e:
-            wait_time = base_delay * (2 ** attempt) + random.uniform(0, 10)
-            logger.error(f"❌ Error: {e} — restarting in {wait_time:.0f}s...")
-            time.sleep(wait_time)
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+    try:
+        bot.run(TOKEN, log_handler=None, reconnect=True)
+    except discord.errors.HTTPException as e:
+        if e.status == 429:
+            logger.error("❌ Rate limited. Sleeping 5 minutes then exiting for Render to restart...")
+            time.sleep(300)  # 5 min cooldown before Render restarts
+        else:
+            logger.error(f"❌ HTTP error: {e}")
+            time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Fatal: {e}")
+        time.sleep(60)
