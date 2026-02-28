@@ -72,16 +72,16 @@ def keep_alive():
 #   2. Server Settings → Roles → Right-click role → Copy Role ID
 # ================================================================
 ROLE_HIERARCHY = [
-    (123456789012345678, None),   # VC Rookie        — everyone else
-    (123456789012345679, 50),     # VC Raider        — top 50
-    (123456789012345680, 40),     # VC Challenger    — top 40
-    (123456789012345681, 30),     # VC Elite         — top 30
-    (123456789012345682, 20),     # VC Legend        — top 20
-    (123456789012345683, 10),     # VC Top Contender — top 10
-    (123456789012345684, 5),      # VC Finalist      — top 5
-    (123456789012345685, 3),      # VC Champ         — top 3
-    (123456789012345686, 2),      # VC MVP           — top 2
-    (123456789012345687, 1),      # Apex Speaker     — #1 only
+    (1477355642271305749, None),   # VC Rookie        — everyone else
+    (1477355709522903081, 50),     # VC Raider        — top 50
+    (1477355810433794088, 40),     # VC Challenger    — top 40
+    (1477355846970114118, 30),     # VC Elite         — top 30
+    (1477355913961537577, 20),     # VC Legend        — top 20
+    (1477356047319695411, 10),     # VC Top Contender — top 10
+    (1477356099484127354, 5),      # VC Finalist      — top 5
+    (1477356210528321670, 3),      # VC Champ         — top 3
+    (1477356266945777828, 2),      # VC MVP           — top 2
+    (1477356310059290767, 1),      # Apex Speaker     — #1 only
 ]
 
 # Set of all VC role IDs for quick membership checks
