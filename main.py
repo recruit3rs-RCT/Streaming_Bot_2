@@ -16,14 +16,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+# ---------------- Logging ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("StreamBot")
 
+# ---------------- Env ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Render provides PORT automatically (commonly 10000). [web:12]
 PORT = int(os.getenv("PORT", "10000"))
 
 MAX_RANKED_USERS = int(os.getenv("MAX_RANKED_USERS", "60"))
@@ -34,6 +38,7 @@ if not TOKEN:
 if not DATABASE_URL:
     raise SystemExit("DATABASE_URL missing")
 
+# ---------------- Discord bot ----------------
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
@@ -41,6 +46,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ---------------- Flask keep-alive ----------------
 app = Flask(__name__)
 
 @app.route("/")
@@ -49,7 +55,10 @@ def home():
 
 @app.route("/health")
 def health():
-    return ({"status": "healthy", "bot_ready": bot.is_ready()}, 200 if bot.is_ready() else 503)
+    return (
+        {"status": "healthy", "bot_ready": bot.is_ready()},
+        200 if bot.is_ready() else 503,
+    )
 
 def run_flask():
     app.run(host="0.0.0.0", port=PORT, threaded=True)
@@ -59,6 +68,7 @@ def keep_alive():
     t.start()
     logger.info(f"Flask server started on port {PORT}")
 
+# ---------------- Role hierarchy (YOUR IDs) ----------------
 ROLE_HIERARCHY = [
     (1477355642271305749, None),   # VC Rookie
     (1477355709522903081, 50),     # VC Raider
@@ -73,6 +83,7 @@ ROLE_HIERARCHY = [
 ]
 VC_ROLE_IDS = {rid for rid, _ in ROLE_HIERARCHY}
 
+# ---------------- DB ----------------
 db_pool = None
 join_times = {}  # (guild_id, user_id) -> monotonic start time
 
@@ -105,6 +116,7 @@ async def init_db():
         )
     logger.info("✅ Database initialized")
 
+# ---------------- Events ----------------
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -112,7 +124,7 @@ async def on_ready():
     if db_pool is None:
         await init_db()
 
-    # IMPORTANT: no auto tree.sync here (can contribute to rate limits if reconnects happen). [web:92]
+    # Do NOT auto-sync commands here.
     if not save_streaming_time.is_running():
         save_streaming_time.start()
     if not auto_update_vc_roles.is_running():
@@ -156,6 +168,7 @@ async def on_voice_state_update(member, before, after):
             )
         logger.info(f"💾 Saved {secs}s for {member}")
 
+# ---------------- Tasks ----------------
 @tasks.loop(seconds=30)
 async def save_streaming_time():
     if db_pool is None:
@@ -175,6 +188,7 @@ async def save_streaming_time():
             continue
 
         is_streaming = bool(member.voice and member.voice.self_stream)
+
         if not is_streaming:
             secs = int(now - start)
             join_times.pop((guild_id, user_id), None)
@@ -252,6 +266,7 @@ async def update_guild_vc_roles(guild: discord.Guild):
             role_cache[rid] = r
         else:
             missing.append(rid)
+
     if missing:
         logger.warning(f"{guild.name} missing role IDs: {missing}")
         return
@@ -288,7 +303,7 @@ async def update_guild_vc_roles(guild: discord.Guild):
 
     logger.info(f"🔄 {guild.name}: updated {updated} members")
 
-# -------------------- Sync command (multi-server friendly) --------------------
+# ---------------- Prefix sync command ----------------
 @bot.command()
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
@@ -296,7 +311,7 @@ async def sync(ctx: commands.Context, spec: str | None = None):
     """
     !sync      -> global sync
     !sync ~    -> sync to current guild only (fast)
-    !sync *    -> copy global to current guild and sync (fast; use for testing) [web:89]
+    !sync *    -> copy global to current guild and sync (fast; testing)
     """
     try:
         if spec == "~":
@@ -317,7 +332,7 @@ async def sync_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Administrator only.")
 
-# -------------------- Slash commands --------------------
+# ---------------- Slash commands ----------------
 @bot.tree.command(name="leaderboard", description="Show streaming time leaderboard (limit: 1-20)")
 async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
     limit = max(1, min(limit, 20))
@@ -345,7 +360,8 @@ async def leaderboard_slash(interaction: discord.Interaction, limit: int = 10):
         m = interaction.guild.get_member(row["user_id"])
         name = m.display_name if m else f"User {row['user_id']}"
         hours = row["total_seconds"] / 3600
-        lines.append(f"**{i}.** {name} — **{hours:.2f}** hours")
+        medal = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"**{i}.**"
+        lines.append(f"{medal} {name} — **{hours:.2f}** hours")
     embed.description = "\n".join(lines)
     await interaction.followup.send(embed=embed)
 
@@ -365,8 +381,9 @@ async def stats_slash(interaction: discord.Interaction, user: discord.Member | N
         return await interaction.followup.send(f"{target.display_name} has no streaming data yet.")
 
     embed = discord.Embed(title=f"🎤 {target.display_name} stats", color=0x5865F2)
-    embed.add_field(name="Total", value=f"{row['total_seconds']/3600:.2f} hours", inline=True)
+    embed.add_field(name="Total time", value=f"**{row['total_seconds']/3600:.2f}** hours", inline=True)
     embed.add_field(name="Last updated", value=str(row["last_updated"])[:19], inline=True)
+    embed.set_thumbnail(url=target.display_avatar.url)
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="chart", description="Streaming time bar chart (limit: 1-15)")
@@ -419,7 +436,12 @@ async def chart_slash(interaction: discord.Interaction, limit: int = 10):
 async def updateroles_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await update_guild_vc_roles(interaction.guild)
-    await interaction.followup.send("✅ Done.", ephemeral=True)
+    await interaction.followup.send("✅ VC roles updated.", ephemeral=True)
+
+@updateroles_slash.error
+async def updateroles_error(interaction: discord.Interaction, error):
+    if isinstance(error, discord.app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
 
 @bot.tree.command(name="resetstats", description="Reset a user's stats (Admin only)")
 @discord.app_commands.checks.has_permissions(administrator=True)
@@ -431,10 +453,40 @@ async def resetstats_slash(interaction: discord.Interaction, user: discord.Membe
             interaction.guild.id,
             user.id,
         )
-    await interaction.followup.send("✅ Reset.", ephemeral=True)
+    await interaction.followup.send(f"✅ Reset stats for {user.display_name}.", ephemeral=True)
 
-# -------------------- Entrypoint --------------------
+@resetstats_slash.error
+async def resetstats_error(interaction: discord.Interaction, error):
+    if isinstance(error, discord.app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
+
+# ---------------- Entrypoint with Cloudflare-safe backoff ----------------
+def looks_like_cloudflare_1015(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return ("error 1015" in s) or ("cloudflare" in s) or ("access denied" in s) or ("<!doctype html>" in s)
+
 if __name__ == "__main__":
     keep_alive()
     time.sleep(random.uniform(2, 6))
-    bot.run(TOKEN, log_handler=None)
+
+    while True:
+        try:
+            bot.run(TOKEN, log_handler=None)
+            break
+        except discord.errors.HTTPException as e:
+            # If Discord/Cloudflare blocks this IP, don't crash-loop and extend it. [web:67]
+            if looks_like_cloudflare_1015(e):
+                logger.error("Cloudflare 1015 / HTML 429 during login. Sleeping 45 minutes then retrying.")
+                time.sleep(45 * 60)
+                continue
+
+            if getattr(e, "status", None) == 429:
+                logger.error("Discord API 429. Sleeping 10 minutes then retrying.")
+                time.sleep(10 * 60)
+                continue
+
+            logger.error(f"HTTPException: {e}. Sleeping 5 minutes then retrying.")
+            time.sleep(5 * 60)
+        except Exception as e:
+            logger.error(f"Fatal: {e}. Sleeping 5 minutes then retrying.")
+            time.sleep(5 * 60)
